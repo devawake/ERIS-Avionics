@@ -1,0 +1,5 @@
+pyserial
+pynmea2
+smbus2
+adafruit-circuitpython-rfm69
+RPi.GPIO
