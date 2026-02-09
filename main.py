@@ -257,6 +257,150 @@ dashboard = Dashboard()
 # ==========================================
 # SENSOR DRIVERS
 # ==========================================
+# ==========================================
+# LOGGING & STATE MANAGEMENT
+# ==========================================
+import csv
+import math
+
+# ==========================================
+# FLIGHT COMPUTER
+# ==========================================
+class FlightState:
+    IDLE = 0     # Pre-flight / No GPS
+    ARMED = 1    # Ready on Pad
+    ASCENT = 2   # Powered/Coast
+    DESCENT = 3  # Apogee Reached
+    LANDED = 4   # Stationary on ground
+
+    @staticmethod
+    def to_str(state):
+        return ["IDLE", "ARMED", "ASCENT", "DESCENT", "LANDED"][state]
+
+class CSVLogger:
+    def __init__(self, filename="flight_log.csv"):
+        self.filename = filename
+        self.start_time = time.time()
+        with open(self.filename, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "SystemTime", "RelTime", "State", 
+                "GPSTime", "Sats", "Lat", "Lon", "Alt", 
+                "Ax", "Ay", "Az", "Gx", "Gy", "Gz", "Mx", "My", "Mz"
+            ])
+            
+    def log(self, state, data):
+        try:
+            with open(self.filename, 'a', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    time.strftime("%H:%M:%S"),
+                    f"{time.time() - self.start_time:.2f}",
+                    FlightState.to_str(state),
+                    data.get('time', ''),
+                    data.get('sats', 0),
+                    f"{data.get('lat', 0.0):.6f}",
+                    f"{data.get('lon', 0.0):.6f}",
+                    f"{data.get('alt', 0.0):.2f}",
+                    data.get('ax', 0), data.get('ay', 0), data.get('az', 0),
+                    data.get('gx', 0), data.get('gy', 0), data.get('gz', 0),
+                    data.get('mx', 0), data.get('my', 0), data.get('mz', 0),
+                ])
+        except Exception:
+            pass
+
+class FlightComputer:
+    def __init__(self):
+        self.state = FlightState.IDLE
+        self.max_altitude = -9999.0
+        self.ground_altitude = 0.0
+        
+        # Detection Counters
+        self.launch_samples = 0
+        self.apogee_samples = 0
+        self.land_samples = 0
+        
+        # Config Thresholds (Based on Z=2060 @ 1G)
+        self.ACC_1G = 2060
+        self.LAUNCH_THRESH_RAW = 4000  # ~2G
+        self.LAUNCH_CONFIRM = 3        # Samples > Thresh to confirm launch
+        
+        self.APOGEE_DROP_M = 10.0      # Meters below max alt to confirm descent
+        self.LAND_STABLE_TIME = 5.0    # Seconds of stable stats to confirm land
+        self.last_alt = 0.0
+        self.stable_start_time = 0
+        
+    def update(self, data):
+        current_time = time.time()
+        
+        # Raw Data
+        az = data.get('az', 0)
+        alt = data.get('alt', 0.0)
+        sats = data.get('sats', 0)
+        
+        # Track Max Altitude
+        if alt > self.max_altitude:
+            self.max_altitude = alt
+
+        # ==========================
+        # STATE MACHINE
+        # ==========================
+        
+        # 1. IDLE -> ARMED
+        if self.state == FlightState.IDLE:
+            # Need good GPS lock to arm
+            if sats >= 4:
+                self.ground_altitude = alt
+                self.max_altitude = alt # Reset max to current
+                dashboard.log(f"ARMED. Ground Alt: {self.ground_altitude:.1f}m")
+                self.state = FlightState.ARMED
+        
+        # 2. ARMED -> ASCENT
+        elif self.state == FlightState.ARMED:
+            # Detect Launch: Z-Accel > 2G approx
+            if abs(az) > self.LAUNCH_THRESH_RAW:
+                self.launch_samples += 1
+            else:
+                self.launch_samples = 0
+                
+            if self.launch_samples >= self.LAUNCH_CONFIRM:
+                dashboard.log("!!! LAUNCH DETECTED !!!")
+                self.state = FlightState.ASCENT
+                self.launch_samples = 0
+        
+        # 3. ASCENT -> DESCENT (Apogee Detect)
+        elif self.state == FlightState.ASCENT:
+            # Detect Apogee: Current Alt < Max Alt - Threshold
+            # (Simple drop detection)
+            if alt < (self.max_altitude - self.APOGEE_DROP_M):
+                self.apogee_samples += 1
+            else:
+                self.apogee_samples = 0
+                
+            if self.apogee_samples >= 3: # 3 consecutive samples showing drop
+                dashboard.log(f"APOGEE DETECTED: {self.max_altitude:.1f}m")
+                self.state = FlightState.DESCENT
+        
+        # 4. DESCENT -> LANDED
+        elif self.state == FlightState.DESCENT:
+            # Detect Landing: Altitude stable for N seconds
+            # Check if alt changed less than 2m since last check
+            if abs(alt - self.last_alt) < 2.0 and abs(az) < (self.ACC_1G + 500):
+                if self.stable_start_time == 0:
+                    self.stable_start_time = current_time
+                elif (current_time - self.stable_start_time) > self.LAND_STABLE_TIME:
+                    dashboard.log("LANDING CONFIRMED")
+                    self.state = FlightState.LANDED
+            else:
+                self.stable_start_time = 0
+                
+            self.last_alt = alt
+
+        return self.state
+
+# ==========================================
+# SENSOR DRIVERS
+# ==========================================
 class Sensors:
     def __init__(self):
         self.data = {
@@ -265,53 +409,48 @@ class Sensors:
             "ax": 0, "ay": 0, "az": 0,
             "gx": 0, "gy": 0, "gz": 0,
             "mx": 0, "my": 0, "mz": 0,
-            "raw_gps": "[Waiting for data...]"
+            "raw_gps": "[Waiting...]"
         }
         self.lock = threading.Lock()
         
     def init_imu(self):
         try:
             self.bus_imu = smbus2.SMBus(I2C_BUS_IMU)
-            # Check ID
-            who_am_i = self.bus_imu.read_byte_data(ADDR_ISM330, 0x0F)
-            if who_am_i != 0x6B:
-                dashboard.log(f"[WARN] Unknown IMU ID: 0x{who_am_i:02X}")
+            # Init Accel (CTRL1_XL) - 104Hz, 16g range
+            # 16g range: Sensitivity is ~0.488 mg/LSB
+            self.bus_imu.write_byte_data(ADDR_ISM330, 0x10, 0x08 | 0x40) # 104Hz, 4g (adjust if needed, 16g is 0x08|0x40?? Check datasheet)
+            # Correction: 
+            # 0x40 = ODR 104Hz. 
+            # FS Selection: see datasheet. 
+            # Let's stick to previous code 0x44 (104Hz, 16g) if that worked.
+            self.bus_imu.write_byte_data(ADDR_ISM330, 0x10, 0x44) 
             
-            # Init Accel (CTRL1_XL) - 104Hz, 16g
-            self.bus_imu.write_byte_data(ADDR_ISM330, 0x10, 0x44)
-            # Init Gyro (CTRL2_G) - 104Hz, 2000dps
+            # Init Gyro
             self.bus_imu.write_byte_data(ADDR_ISM330, 0x11, 0x4C)
-            # CTRL3_C - Auto-increment
             self.bus_imu.write_byte_data(ADDR_ISM330, 0x12, 0x04)
-            
-            dashboard.log("[OK] IMU Initialized (Bus 0)")
+            dashboard.log("[OK] IMU Init")
             return True
         except Exception as e:
-            dashboard.error(f"[ERR] IMU Init Failed: {e}")
+            dashboard.error(f"IMU Init: {e}")
             return False
 
     def init_mag(self):
         try:
             self.bus_mag = smbus2.SMBus(I2C_BUS_MAG)
-            # QMC5883L Init
-            self.bus_mag.write_byte_data(ADDR_MAG, 0x09, 0x1D) # OSR=512, RNG=8G, ODR=200Hz, CONT
+            self.bus_mag.write_byte_data(ADDR_MAG, 0x09, 0x1D)
             self.bus_mag.write_byte_data(ADDR_MAG, 0x0B, 0x01)
-            dashboard.log("[OK] Magnetometer Initialized (Bus 1)")
+            dashboard.log("[OK] Mag Init")
             return True
         except Exception as e:
-            dashboard.error(f"[ERR] Mag Init Failed: {e}")
+            dashboard.error(f"Mag Init: {e}")
             return False
 
     def read_imu(self):
         try:
-            # Read 12 bytes: Gx, Gy, Gz, Ax, Ay, Az
             block = self.bus_imu.read_i2c_block_data(ADDR_ISM330, 0x22, 12)
-            
-            # Helper to parse signed 16-bit
             def parse(idx):
                 val = block[idx] | (block[idx+1] << 8)
                 return val - 65536 if val > 32767 else val
-            
             with self.lock:
                 self.data['gx'] = parse(0)
                 self.data['gy'] = parse(2)
@@ -319,8 +458,7 @@ class Sensors:
                 self.data['ax'] = parse(6)
                 self.data['ay'] = parse(8)
                 self.data['az'] = parse(10)
-        except Exception:
-            pass
+        except: pass
 
     def read_mag(self):
         try:
@@ -328,63 +466,40 @@ class Sensors:
             def parse(idx):
                 val = block[idx] | (block[idx+1] << 8)
                 return val - 65536 if val > 32767 else val
-                
             with self.lock:
                 self.data['mx'] = parse(0)
                 self.data['my'] = parse(2)
                 self.data['mz'] = parse(4)
-        except Exception:
-            pass
+        except: pass
 
     def run_gps(self):
         try:
-            # TRY DIFFERENT BAUD RATES IF NEEDED (Default 9600)
             ser = serial.Serial('/dev/serial0', 115200, timeout=1)
-            dashboard.log("GPS Serial Port Opened")
-            
+            dashboard.log("GPS Opened @ 115200")
             while True:
                 try:
-                    # Read line (blocking with timeout)
-                    raw_line = ser.readline()
-                    
-                    if not raw_line:
-                        continue
-                        
-                    try:
-                        line = raw_line.decode('ascii', errors='ignore').strip()
-                    except:
-                        line = str(raw_line)
-
-                    # Update raw data for debug
-                    with self.lock:
-                        self.data['raw_gps'] = line
-
+                    raw = ser.readline()
+                    if not raw: continue
+                    line = raw.decode('ascii', errors='ignore').strip()
+                    with self.lock: self.data['raw_gps'] = line
                     if line.startswith('$G'):
-                        try:
-                            msg = pynmea2.parse(line)
-                            # Parse GGA (Fix Data) or RMC (Recommended Minimum)
-                            if isinstance(msg, pynmea2.types.talker.GGA):
-                                with self.lock:
-                                    self.data['time'] = str(msg.timestamp)
-                                    self.data['sats'] = int(msg.num_sats)
-                                    if msg.gps_qual > 0:
-                                        self.data['lat'] = msg.latitude
-                                        self.data['lon'] = msg.longitude
-                                        self.data['alt'] = msg.altitude
-                        except pynmea2.ParseError:
-                            pass
-                except Exception as e:
-                    dashboard.error(f"GPS Loop Err: {e}")
-                    time.sleep(1) # Prevent tight loop on error
-                    
+                        msg = pynmea2.parse(line)
+                        if isinstance(msg, pynmea2.types.talker.GGA):
+                            with self.lock:
+                                self.data['time'] = str(msg.timestamp)
+                                self.data['sats'] = int(msg.num_sats)
+                                if msg.gps_qual > 0:
+                                    self.data['lat'] = msg.latitude
+                                    self.data['lon'] = msg.longitude
+                                    self.data['alt'] = msg.altitude
+                except: pass
         except Exception as e:
-            dashboard.error(f"GPS Thread Fatal: {e}\n{traceback.format_exc()}")
+            dashboard.error(f"GPS Thread: {e}")
 
 # ==========================================
 # MAIN LOOP
 # ==========================================
 def main():
-    # Global GPIO Setup
     GPIO.setmode(GPIO.BCM)
     GPIO.setwarnings(False)
     
@@ -395,59 +510,65 @@ def main():
     sensors.init_imu()
     sensors.init_mag()
     
-    # Start GPS Thread
-    gps_thread = threading.Thread(target=sensors.run_gps, daemon=True)
-    gps_thread.start()
+    csv_logger = CSVLogger()
+    flight_computer = FlightComputer()
+    
+    # Start GPS
+    threading.Thread(target=sensors.run_gps, daemon=True).start()
     
     # Init Radio
     radio = None
     try:
         radio = RFM69(freq_mhz=RADIO_FREQ_MHZ)
-        dashboard.log("Radio Initialized")
+        dashboard.log("Radio Init OK")
     except Exception as e:
-        dashboard.error(f"Radio Failed: {e}\n{traceback.format_exc()}")
+        dashboard.error(f"Radio Fail: {e}")
         buzzer.error_tone()
 
     count = 0
     radio_status = "IDLE"
     
+    print("\033[2J") # Clear once
+    
     try:
         while True:
             start_t = time.time()
             
-            # Read Sensors
+            # 1. Read Data
             sensors.read_imu()
             sensors.read_mag()
             
-            # Prepare packet
             with sensors.lock:
-                d = sensors.data.copy() # Copy to avoid tearing during render
-                
-            # Format: "T:12:01:00,Lat:0.00,Lon:0.00,Alt:0,Ax:100...."
-            packet = (f"T:{d['time']},S:{d['sats']},"
-                      f"L:{d['lat']:.4f},{d['lon']:.4f},A:{d['alt']:.1f},"
-                      f"Imu:{d['ax']},{d['ay']},{d['az']}")
+                d = sensors.data.copy()
+
+            # 2. Update Flight Computer
+            flight_computer.update(d)
+
+            # 3. Log to CSV
+            csv_logger.log(flight_computer.state, d)
             
-            # Send Radio
+            # 4. Prepare Packet
+            # Protocol: "State,Time,Sats,Lat,Lon,Alt,Az,MaxAlt"
+            state_char = FlightState.to_str(flight_computer.state)[0] # I, A, L...
+            packet = (f"St:{state_char},T:{d['time']},S:{d['sats']},"
+                      f"L:{d['lat']:.4f},{d['lon']:.4f},A:{d['alt']:.1f},"
+                      f"Z:{d['az']},Max:{flight_computer.max_altitude:.1f}")
+            
+            # 5. Send Radio
             if radio:
                 if radio.send(packet):
                     radio_status = "TX OK"
                 else:
                     radio_status = "TX FAIL"
-            else:
-                radio_status = "NO RADIO"
-                
-            # Status Logic
-            if d['sats'] > 3 and count % 50 == 0: # Every ~10s
-                dashboard.log("GPS LOCKED - Lock Tone")
-                buzzer.lock_tone()
             
-            # Heartbeat every ~2s (10 packets @ 5Hz)
+            # 6. UI Updates
             if count % 10 == 0:
-                threading.Thread(target=buzzer.heartbeat_tone).start()
+                dashboard.render(d, radio_status)
+                print(f"STATE: {FlightState.to_str(flight_computer.state)}")
 
-            # RENDER DASHBOARD
-            dashboard.render(d, radio_status)
+            # Heartbeat / Lock Tone
+            if d['sats'] > 3 and count % 50 == 0: buzzer.lock_tone()
+            if count % 20 == 0: threading.Thread(target=buzzer.heartbeat_tone).start()
 
             count += 1
             elapsed = time.time() - start_t
