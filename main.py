@@ -192,6 +192,71 @@ class Buzzer:
 # ==========================================
 # SENSOR DRIVERS
 # ==========================================
+# ==========================================
+# LOGGING & UI
+# ==========================================
+from collections import deque
+import traceback
+
+class Dashboard:
+    def __init__(self):
+        self.logs = deque(maxlen=10)
+        self.errors = deque(maxlen=5)
+    
+    def log(self, msg):
+        timestamp = time.strftime("%H:%M:%S")
+        self.logs.append(f"[{timestamp}] {msg}")
+        
+    def error(self, msg):
+        timestamp = time.strftime("%H:%M:%S")
+        self.errors.append(f"[{timestamp}] {msg}")
+
+    def render(self, sensor_data, radio_status):
+        # ANSI Escape Codes: Clear Screen, Home Cursor
+        # \033[2J clears screen, \033[H moves to top-left
+        output = "\033[2J\033[H"
+        
+        output += "==================================================\n"
+        output += "           ERIS AVIONICS DASHBOARD               \n"
+        output += "==================================================\n\n"
+        
+        # SENSOR DATA SECTION
+        d = sensor_data
+        output += f"SYSTEM TIME : {time.strftime('%H:%M:%S')}\n"
+        output += f"GPS TIME    : {d.get('time', 'N/A')}\n"
+        output += f"SATELLITES  : {d.get('sats', 0)}\n"
+        output += f"LATITUDE    : {d.get('lat', 0.0):.6f}\n"
+        output += f"LONGITUDE   : {d.get('lon', 0.0):.6f}\n"
+        output += f"ALTITUDE    : {d.get('alt', 0.0):.1f} m\n"
+        output += "\n"
+        output += f"ACCEL (mg)  : X={d.get('ax',0):>6} Y={d.get('ay',0):>6} Z={d.get('az',0):>6}\n"
+        output += f"GYRO (dps)  : X={d.get('gx',0):>6} Y={d.get('gy',0):>6} Z={d.get('gz',0):>6}\n"
+        output += f"MAG (uT)    : X={d.get('mx',0):>6} Y={d.get('my',0):>6} Z={d.get('mz',0):>6}\n"
+        output += "\n"
+        output += f"RADIO STATE : {radio_status}\n"
+        output += f"RAW GPS     : {d.get('raw_gps', '')[:50]}\n" # Show first 50 chars of raw GPS
+        
+        output += "\n" + "="*50 + "\n"
+        output += "LOGS\n"
+        output += "="*50 + "\n"
+        
+        for log in self.logs:
+            output += f" > {log}\n"
+            
+        if self.errors:
+            output += "\n" + "!"*50 + "\n"
+            output += "ERRORS / TRACEBACKS\n"
+            output += "!"*50 + "\n"
+            for err in self.errors:
+                output += f"{err}\n"
+                
+        print(output)
+
+dashboard = Dashboard()
+
+# ==========================================
+# SENSOR DRIVERS
+# ==========================================
 class Sensors:
     def __init__(self):
         self.data = {
@@ -199,7 +264,8 @@ class Sensors:
             "lat": 0.0, "lon": 0.0, "alt": 0.0, "sats": 0,
             "ax": 0, "ay": 0, "az": 0,
             "gx": 0, "gy": 0, "gz": 0,
-            "mx": 0, "my": 0, "mz": 0
+            "mx": 0, "my": 0, "mz": 0,
+            "raw_gps": "[Waiting for data...]"
         }
         self.lock = threading.Lock()
         
@@ -209,7 +275,7 @@ class Sensors:
             # Check ID
             who_am_i = self.bus_imu.read_byte_data(ADDR_ISM330, 0x0F)
             if who_am_i != 0x6B:
-                print(f"[WARN] Unknown IMU ID: 0x{who_am_i:02X}")
+                dashboard.log(f"[WARN] Unknown IMU ID: 0x{who_am_i:02X}")
             
             # Init Accel (CTRL1_XL) - 104Hz, 16g
             self.bus_imu.write_byte_data(ADDR_ISM330, 0x10, 0x44)
@@ -218,10 +284,10 @@ class Sensors:
             # CTRL3_C - Auto-increment
             self.bus_imu.write_byte_data(ADDR_ISM330, 0x12, 0x04)
             
-            print("[OK] IMU Initialized (Bus 0)")
+            dashboard.log("[OK] IMU Initialized (Bus 0)")
             return True
         except Exception as e:
-            print(f"[ERR] IMU Init Failed: {e}")
+            dashboard.error(f"[ERR] IMU Init Failed: {e}")
             return False
 
     def init_mag(self):
@@ -230,10 +296,10 @@ class Sensors:
             # QMC5883L Init
             self.bus_mag.write_byte_data(ADDR_MAG, 0x09, 0x1D) # OSR=512, RNG=8G, ODR=200Hz, CONT
             self.bus_mag.write_byte_data(ADDR_MAG, 0x0B, 0x01)
-            print("[OK] Magnetometer Initialized (Bus 1)")
+            dashboard.log("[OK] Magnetometer Initialized (Bus 1)")
             return True
         except Exception as e:
-            print(f"[ERR] Mag Init Failed: {e}")
+            dashboard.error(f"[ERR] Mag Init Failed: {e}")
             return False
 
     def read_imu(self):
@@ -272,30 +338,52 @@ class Sensors:
 
     def run_gps(self):
         try:
+            # TRY DIFFERENT BAUD RATES IF NEEDED (Default 9600)
             ser = serial.Serial('/dev/serial0', 9600, timeout=1)
+            dashboard.log("GPS Serial Port Opened")
+            
             while True:
-                line = ser.readline().decode('ascii', errors='ignore').strip()
-                if line.startswith('$G'):
+                try:
+                    # Read line (blocking with timeout)
+                    raw_line = ser.readline()
+                    
+                    if not raw_line:
+                        continue
+                        
                     try:
-                        msg = pynmea2.parse(line)
-                        if isinstance(msg, pynmea2.types.talker.GGA):
-                            with self.lock:
-                                self.data['time'] = str(msg.timestamp)
-                                self.data['sats'] = int(msg.num_sats)
-                                if msg.gps_qual > 0:
-                                    self.data['lat'] = msg.latitude
-                                    self.data['lon'] = msg.longitude
-                                    self.data['alt'] = msg.altitude
-                    except: pass
+                        line = raw_line.decode('ascii', errors='ignore').strip()
+                    except:
+                        line = str(raw_line)
+
+                    # Update raw data for debug
+                    with self.lock:
+                        self.data['raw_gps'] = line
+
+                    if line.startswith('$G'):
+                        try:
+                            msg = pynmea2.parse(line)
+                            # Parse GGA (Fix Data) or RMC (Recommended Minimum)
+                            if isinstance(msg, pynmea2.types.talker.GGA):
+                                with self.lock:
+                                    self.data['time'] = str(msg.timestamp)
+                                    self.data['sats'] = int(msg.num_sats)
+                                    if msg.gps_qual > 0:
+                                        self.data['lat'] = msg.latitude
+                                        self.data['lon'] = msg.longitude
+                                        self.data['alt'] = msg.altitude
+                        except pynmea2.ParseError:
+                            pass
+                except Exception as e:
+                    dashboard.error(f"GPS Loop Err: {e}")
+                    time.sleep(1) # Prevent tight loop on error
+                    
         except Exception as e:
-            print(f"[ERR] GPS Thread: {e}")
+            dashboard.error(f"GPS Thread Fatal: {e}\n{traceback.format_exc()}")
 
 # ==========================================
 # MAIN LOOP
 # ==========================================
 def main():
-    print("--- INTEGRATED AVIONICS ---")
-    
     # Global GPIO Setup
     GPIO.setmode(GPIO.BCM)
     GPIO.setwarnings(False)
@@ -304,24 +392,24 @@ def main():
     buzzer.startup_sequence()
     
     sensors = Sensors()
-    if not sensors.init_imu(): buzzer.error_tone()
-    if not sensors.init_mag(): buzzer.error_tone()
+    sensors.init_imu()
+    sensors.init_mag()
     
     # Start GPS Thread
     gps_thread = threading.Thread(target=sensors.run_gps, daemon=True)
     gps_thread.start()
     
     # Init Radio
+    radio = None
     try:
         radio = RFM69(freq_mhz=RADIO_FREQ_MHZ)
-        print("[OK] Radio Initialized")
+        dashboard.log("Radio Initialized")
     except Exception as e:
-        print(f"[ERR] Radio Failed: {e}")
+        dashboard.error(f"Radio Failed: {e}\n{traceback.format_exc()}")
         buzzer.error_tone()
-        return
 
-    print("Starting loop...")
     count = 0
+    radio_status = "IDLE"
     
     try:
         while True:
@@ -333,29 +421,33 @@ def main():
             
             # Prepare packet
             with sensors.lock:
-                d = sensors.data
-                # Format: "T:12:01:00,Lat:0.00,Lon:0.00,Alt:0,Ax:100...."
-                packet = (f"T:{d['time']},S:{d['sats']},"
-                          f"L:{d['lat']:.4f},{d['lon']:.4f},A:{d['alt']:.1f},"
-                          f"Imu:{d['ax']},{d['ay']},{d['az']}")
+                d = sensors.data.copy() # Copy to avoid tearing during render
+                
+            # Format: "T:12:01:00,Lat:0.00,Lon:0.00,Alt:0,Ax:100...."
+            packet = (f"T:{d['time']},S:{d['sats']},"
+                      f"L:{d['lat']:.4f},{d['lon']:.4f},A:{d['alt']:.1f},"
+                      f"Imu:{d['ax']},{d['ay']},{d['az']}")
             
-            print(f"[TX] {packet[:60]}...")
-            
-            # Send
-            if radio.send(packet):
-                print("   -> Sent OK")
+            # Send Radio
+            if radio:
+                if radio.send(packet):
+                    radio_status = "TX OK"
+                else:
+                    radio_status = "TX FAIL"
             else:
-                print("   -> Send Failed")
+                radio_status = "NO RADIO"
                 
             # Status Logic
             if d['sats'] > 3 and count % 50 == 0: # Every ~10s
-                # GPS Locked Pulse
-                print("   [GPS LOCKED]")
+                dashboard.log("GPS LOCKED - Lock Tone")
                 buzzer.lock_tone()
             
             # Heartbeat every ~2s (10 packets @ 5Hz)
             if count % 10 == 0:
                 threading.Thread(target=buzzer.heartbeat_tone).start()
+
+            # RENDER DASHBOARD
+            dashboard.render(d, radio_status)
 
             count += 1
             elapsed = time.time() - start_t
@@ -364,7 +456,7 @@ def main():
                 
     except KeyboardInterrupt:
         print("\nStopping...")
-        radio.close()
+        if radio: radio.close()
         GPIO.cleanup()
 
 if __name__ == "__main__":
