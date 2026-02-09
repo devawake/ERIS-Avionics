@@ -339,7 +339,7 @@ class Sensors:
     def run_gps(self):
         try:
             # TRY DIFFERENT BAUD RATES IF NEEDED (Default 9600)
-            ser = serial.Serial('/dev/serial0', 9600, timeout=1)
+            ser = serial.Serial('/dev/serial0', 115200, timeout=1)
             dashboard.log("GPS Serial Port Opened")
             
             while True:
