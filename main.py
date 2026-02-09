@@ -351,7 +351,7 @@ def main():
             if d['sats'] > 3 and count % 50 == 0: # Every ~10s
                 # GPS Locked Pulse
                 print("   [GPS LOCKED]")
-                # buzzer.lock_tone()
+                buzzer.lock_tone()
             
             # Heartbeat every ~2s (10 packets @ 5Hz)
             if count % 10 == 0:
