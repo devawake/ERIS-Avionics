@@ -211,7 +211,7 @@ class Dashboard:
         timestamp = time.strftime("%H:%M:%S")
         self.errors.append(f"[{timestamp}] {msg}")
 
-    def render(self, sensor_data, radio_status):
+    def render(self, sensor_data, radio_status, video_status="N/A"):
         # ANSI Escape Codes: Clear Screen, Home Cursor
         # \033[2J clears screen, \033[H moves to top-left
         output = "\033[2J\033[H"
@@ -234,6 +234,7 @@ class Dashboard:
         output += f"MAG (uT)    : X={d.get('mx',0):>6} Y={d.get('my',0):>6} Z={d.get('mz',0):>6}\n"
         output += "\n"
         output += f"RADIO STATE : {radio_status}\n"
+        output += f"VIDEO STATE : {video_status}\n"
         output += f"RAW GPS     : {d.get('raw_gps', '')[:50]}\n" # Show first 50 chars of raw GPS
         
         output += "\n" + "="*50 + "\n"
@@ -249,10 +250,74 @@ class Dashboard:
             output += "!"*50 + "\n"
             for err in self.errors:
                 output += f"{err}\n"
+        
+        # DEBUG MENU
+        output += "\n" + "-"*50 + "\n"
+        output += "DEBUG CONTROLS (Type & Enter):\n"
+        output += " 'arm'   -> Force ARM\n"
+        output += " 'launch'-> Force ASCENT\n"
+        output += " 'land'  -> Force LANDED\n"
+        output += " 'video' -> Toggle Video\n"
+        output += " 'reset' -> Reset State\n"
                 
         print(output)
 
 dashboard = Dashboard()
+
+# ==========================================
+# VIDEO RECORDER
+# ==========================================
+import subprocess
+
+class VideoRecorder:
+    def __init__(self):
+        self.process = None
+        self.filename = None
+
+    def start_recording(self):
+        if self.process is not None:
+            return # Already recording
+            
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        self.filename = f"flight_{timestamp}.h264"
+        
+        # libcamera-vid command
+        # -t 0 : record indefinitely
+        # --inline: headers for recovering stream if crashed (optional but good)
+        # --width 1920 --height 1080 : 1080p
+        cmd = [
+            "libcamera-vid",
+            "-t", "0",
+            "--inline",
+            "--width", "1920",
+            "--height", "1080",
+            "-o", self.filename,
+            "--nopreview"
+        ]
+        
+        try:
+            # shell=False is safer, uses list of args
+            self.process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            dashboard.log(f"Video START: {self.filename}")
+            return True
+        except Exception as e:
+            dashboard.error(f"Video Fail: {e}")
+            return False
+
+    def stop_recording(self):
+        if self.process is None:
+            return
+            
+        try:
+            self.process.terminate()
+            self.process.wait(timeout=2)
+            dashboard.log("Video STOPPED")
+        except:
+            try:
+                self.process.kill()
+            except: pass
+        finally:
+            self.process = None
 
 # ==========================================
 # SENSOR DRIVERS
@@ -310,10 +375,11 @@ class CSVLogger:
             pass
 
 class FlightComputer:
-    def __init__(self):
+    def __init__(self, video_recorder=None):
         self.state = FlightState.IDLE
         self.max_altitude = -9999.0
         self.ground_altitude = 0.0
+        self.video = video_recorder
         
         # Detection Counters
         self.launch_samples = 0
@@ -348,12 +414,12 @@ class FlightComputer:
         
         # 1. IDLE -> ARMED
         if self.state == FlightState.IDLE:
-            # Need good GPS lock to arm
             if sats >= 4:
                 self.ground_altitude = alt
                 self.max_altitude = alt # Reset max to current
                 dashboard.log(f"ARMED. Ground Alt: {self.ground_altitude:.1f}m")
                 self.state = FlightState.ARMED
+                if self.video: self.video.start_recording()
         
         # 2. ARMED -> ASCENT
         elif self.state == FlightState.ARMED:
@@ -391,12 +457,25 @@ class FlightComputer:
                 elif (current_time - self.stable_start_time) > self.LAND_STABLE_TIME:
                     dashboard.log("LANDING CONFIRMED")
                     self.state = FlightState.LANDED
+                    if self.video: self.video.stop_recording()
             else:
                 self.stable_start_time = 0
                 
             self.last_alt = alt
 
-        return self.state
+    def force_state(self, new_state):
+        dashboard.log(f"DEBUG: Force State -> {FlightState.to_str(new_state)}")
+        self.state = new_state
+        
+        # Handle side effects of forcing
+        if new_state == FlightState.ARMED:
+            if self.video: self.video.start_recording()
+        elif new_state == FlightState.LANDED:
+            if self.video: self.video.stop_recording()
+        elif new_state == FlightState.IDLE:
+            if self.video: self.video.stop_recording()
+
+
 
 # ==========================================
 # SENSOR DRIVERS
@@ -506,12 +585,14 @@ def main():
     buzzer = Buzzer(PIN_BUZZER)
     buzzer.startup_sequence()
     
+    video = VideoRecorder()
+    
     sensors = Sensors()
     sensors.init_imu()
     sensors.init_mag()
     
     csv_logger = CSVLogger()
-    flight_computer = FlightComputer()
+    flight_computer = FlightComputer(video_recorder=video)
     
     # Start GPS
     threading.Thread(target=sensors.run_gps, daemon=True).start()
@@ -527,6 +608,9 @@ def main():
 
     count = 0
     radio_status = "IDLE"
+    
+    # Non-blocking input setup
+    import select
     
     print("\033[2J") # Clear once
     
@@ -561,10 +645,23 @@ def main():
                 else:
                     radio_status = "TX FAIL"
             
-            # 6. UI Updates
+            # 6. UI Updates & DEBUG INPUT
             if count % 10 == 0:
-                dashboard.render(d, radio_status)
-                print(f"STATE: {FlightState.to_str(flight_computer.state)}")
+                vid_state = "REC" if (video.process is not None) else "STOP"
+                dashboard.render(d, radio_status, vid_state)
+                #print(f"STATE: {FlightState.to_str(flight_computer.state)}") # Duplicate with dashboard
+
+            # Check for Debug Input
+            if sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
+                cmd = sys.stdin.readline().strip().lower()
+                if cmd == 'arm': flight_computer.force_state(FlightState.ARMED)
+                elif cmd == 'launch': flight_computer.force_state(FlightState.ASCENT)
+                elif cmd == 'land': flight_computer.force_state(FlightState.LANDED)
+                elif cmd == 'reset': flight_computer.force_state(FlightState.IDLE)
+                elif cmd == 'video':
+                    if video.process: video.stop_recording()
+                    else: video.start_recording()
+
 
             # Heartbeat / Lock Tone
             if d['sats'] > 3 and count % 50 == 0: buzzer.lock_tone()
@@ -578,6 +675,7 @@ def main():
     except KeyboardInterrupt:
         print("\nStopping...")
         if radio: radio.close()
+        video.stop_recording()
         GPIO.cleanup()
 
 if __name__ == "__main__":
