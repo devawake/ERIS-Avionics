@@ -305,7 +305,7 @@ import subprocess
 import shutil
 
 class VideoRecorder:
-    RECORDINGS_DIR = os.path.expanduser("~/recordings")
+    RECORDINGS_DIR = os.path.expanduser("/home/eris/ERIS-Avionics/recordings")
 
     def __init__(self):
         self.process = None
