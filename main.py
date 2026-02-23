@@ -103,9 +103,9 @@ class RFM69:
         # Config: Packet mode, FSK
         config = [
             (REG_DATAMODUL, 0x00),
-            (REG_BITRATEMSB, 0x1A), (REG_BITRATELSB, 0x0B), # 4.8 kbps
-            (REG_FDEVMSB, 0x00), (REG_FDEVLSB, 0x52),       # 5kHz dev
-            (REG_RXBW, 0x55),
+            (REG_BITRATEMSB, 0x06), (REG_BITRATELSB, 0x83), # 19.2 kbps
+            (REG_FDEVMSB, 0x01), (REG_FDEVLSB, 0x9A),       # 25kHz dev
+            (REG_RXBW, 0x42),                                 # RxBw 83.3kHz
             (REG_SYNCCONFIG, 0x88), (REG_SYNCVALUE1, 0x2D), (REG_SYNCVALUE2, 0xD4),
             (REG_PACKETCONFIG1, 0x90), # Variable len, CRC on
             (REG_PAYLOADLENGTH, 66),
@@ -132,7 +132,10 @@ class RFM69:
         if isinstance(data, str): data = data.encode('utf-8')
         
         self.write_reg(REG_OPMODE, MODE_STANDBY)
-        while not (self.read_reg(REG_IRQFLAGS1) & 0x80): pass
+        timeout = time.time() + 0.5
+        while not (self.read_reg(REG_IRQFLAGS1) & 0x80):
+            if time.time() > timeout: return False
+            time.sleep(0.001)
         
         # Write FIFO
         self.spi.xfer2([REG_FIFO | 0x80, len(data)] + list(data))
@@ -144,6 +147,7 @@ class RFM69:
         start = time.time()
         while not (self.read_reg(REG_IRQFLAGS2) & 0x08):
             if time.time() - start > 1.0: return False
+            time.sleep(0.001)
         
         self.write_reg(REG_OPMODE, MODE_STANDBY)
         return True
@@ -158,15 +162,29 @@ class RFM69:
 class Buzzer:
     def __init__(self, pin):
         self.pin = pin
+        self._lock = threading.Lock()
         GPIO.setup(pin, GPIO.OUT)
         self.pwm = GPIO.PWM(pin, 1000) # 1kHz
         self.pwm.start(0)
         
+    def _beep_sync(self, freq=2000, duration=0.1):
+        """Blocking beep - call from a thread."""
+        with self._lock:
+            try:
+                self.pwm.ChangeFrequency(freq)
+                self.pwm.ChangeDutyCycle(50)
+                time.sleep(duration)
+                self.pwm.ChangeDutyCycle(0)
+            except Exception:
+                pass
+
     def beep(self, freq=2000, duration=0.1):
-        self.pwm.ChangeFrequency(freq)
-        self.pwm.ChangeDutyCycle(50)
-        time.sleep(duration)
-        self.pwm.ChangeDutyCycle(0)
+        """Blocking beep for startup/error (used before main loop)."""
+        self._beep_sync(freq, duration)
+
+    def beep_async(self, freq=2000, duration=0.1):
+        """Non-blocking beep for use in main loop."""
+        threading.Thread(target=self._beep_sync, args=(freq, duration), daemon=True).start()
         
     def startup_sequence(self):
         self.beep(1000, 0.1)
@@ -179,15 +197,26 @@ class Buzzer:
         self.beep(500, 0.5)
 
     def lock_tone(self):
-        self.beep(2000, 0.05)
-        time.sleep(0.05)
-        self.beep(2000, 0.05)
+        def _seq():
+            self._beep_sync(2000, 0.05)
+            time.sleep(0.05)
+            self._beep_sync(2000, 0.05)
+        threading.Thread(target=_seq, daemon=True).start()
 
     def heartbeat_tone(self):
-        # "Lub-dub" sound: Low pitch, short duration
-        self.beep(800, 0.05)
-        time.sleep(0.05)
-        self.beep(800, 0.05)
+        def _seq():
+            self._beep_sync(800, 0.05)
+            time.sleep(0.05)
+            self._beep_sync(800, 0.05)
+        threading.Thread(target=_seq, daemon=True).start()
+
+    def cleanup(self):
+        """Safe PWM cleanup."""
+        try:
+            self.pwm.ChangeDutyCycle(0)
+            self.pwm.stop()
+        except Exception:
+            pass
 
 # ==========================================
 # SENSOR DRIVERS
@@ -223,7 +252,12 @@ class Dashboard:
         # SENSOR DATA SECTION
         d = sensor_data
         output += f"SYSTEM TIME : {time.strftime('%H:%M:%S')}\n"
-        output += f"GPS TIME    : {d.get('time', 'N/A')}\n"
+        gps_t = d.get('time', 0)
+        if isinstance(gps_t, int) and gps_t > 0:
+            gps_time_str = f"{gps_t // 3600:02d}:{(gps_t % 3600) // 60:02d}:{gps_t % 60:02d}"
+        else:
+            gps_time_str = "No Fix"
+        output += f"GPS TIME    : {gps_time_str}\n"
         output += f"SATELLITES  : {d.get('sats', 0)}\n"
         output += f"LATITUDE    : {d.get('lat', 0.0):.6f}\n"
         output += f"LONGITUDE   : {d.get('lon', 0.0):.6f}\n"
@@ -268,32 +302,54 @@ dashboard = Dashboard()
 # VIDEO RECORDER
 # ==========================================
 import subprocess
+import shutil
 
 class VideoRecorder:
     def __init__(self):
         self.process = None
         self.filename = None
+        self.cmd_tool = "libcamera-vid"
+        
+        # Check if tool exists
+        if shutil.which(self.cmd_tool) is None:
+            # Fallback for older Pi OS?
+            if shutil.which("raspivid"):
+                self.cmd_tool = "raspivid"
+                dashboard.log("WARN: Using 'raspivid' fallback")
+            else:
+                self.cmd_tool = None
+                dashboard.error("ERR: No video tool found!")
 
     def start_recording(self):
         if self.process is not None:
             return # Already recording
+        
+        if self.cmd_tool is None:
+            dashboard.error("Video Fail: No camera tool installed")
+            return False
             
         timestamp = time.strftime("%Y%m%d-%H%M%S")
         self.filename = f"flight_{timestamp}.h264"
         
-        # libcamera-vid command
-        # -t 0 : record indefinitely
-        # --inline: headers for recovering stream if crashed (optional but good)
-        # --width 1920 --height 1080 : 1080p
-        cmd = [
-            "libcamera-vid",
-            "-t", "0",
-            "--inline",
-            "--width", "1920",
-            "--height", "1080",
-            "-o", self.filename,
-            "--nopreview"
-        ]
+        cmd = []
+        if self.cmd_tool == "libcamera-vid":
+            cmd = [
+                "libcamera-vid",
+                "-t", "0",
+                "--inline",
+                "--width", "1920",
+                "--height", "1080",
+                "-o", self.filename,
+                "--nopreview"
+            ]
+        elif self.cmd_tool == "raspivid":
+            cmd = [
+                "raspivid",
+                "-t", "0",
+                "-w", "1920",
+                "-h", "1080",
+                "-o", self.filename
+            ]
         
         try:
             # shell=False is safer, uses list of args
@@ -483,7 +539,7 @@ class FlightComputer:
 class Sensors:
     def __init__(self):
         self.data = {
-            "time": "00:00:00",
+            "time": 0,  # Seconds since midnight (int) - ground station expects int
             "lat": 0.0, "lon": 0.0, "alt": 0.0, "sats": 0,
             "ax": 0, "ay": 0, "az": 0,
             "gx": 0, "gy": 0, "gz": 0,
@@ -565,13 +621,23 @@ class Sensors:
                         msg = pynmea2.parse(line)
                         if isinstance(msg, pynmea2.types.talker.GGA):
                             with self.lock:
-                                self.data['time'] = str(msg.timestamp)
-                                self.data['sats'] = int(msg.num_sats)
-                                if msg.gps_qual > 0:
+                                # Convert timestamp to seconds-since-midnight int
+                                # Ground station expects int for T: field
+                                ts = msg.timestamp
+                                if ts is not None:
+                                    self.data['time'] = int(ts.hour * 3600 + ts.minute * 60 + ts.second)
+                                else:
+                                    self.data['time'] = 0
+                                try:
+                                    self.data['sats'] = int(msg.num_sats) if msg.num_sats else 0
+                                except (ValueError, TypeError):
+                                    self.data['sats'] = 0
+                                if msg.gps_qual and msg.gps_qual > 0:
                                     self.data['lat'] = msg.latitude
                                     self.data['lon'] = msg.longitude
-                                    self.data['alt'] = msg.altitude
-                except: pass
+                                    self.data['alt'] = msg.altitude if msg.altitude else 0.0
+                except Exception:
+                    pass
         except Exception as e:
             dashboard.error(f"GPS Thread: {e}")
 
@@ -663,9 +729,9 @@ def main():
                     else: video.start_recording()
 
 
-            # Heartbeat / Lock Tone
+            # Heartbeat / Lock Tone (already non-blocking now)
             if d['sats'] > 3 and count % 50 == 0: buzzer.lock_tone()
-            if count % 20 == 0: threading.Thread(target=buzzer.heartbeat_tone).start()
+            if count % 20 == 0: buzzer.heartbeat_tone()
 
             count += 1
             elapsed = time.time() - start_t
@@ -676,7 +742,11 @@ def main():
         print("\nStopping...")
         if radio: radio.close()
         video.stop_recording()
-        GPIO.cleanup()
+        buzzer.cleanup()
+        try:
+            GPIO.cleanup()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()
