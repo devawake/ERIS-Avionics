@@ -308,17 +308,20 @@ class VideoRecorder:
     def __init__(self):
         self.process = None
         self.filename = None
-        self.cmd_tool = "libcamera-vid"
+        self.cmd_tool = None
         
-        # Check if tool exists
-        if shutil.which(self.cmd_tool) is None:
-            # Fallback for older Pi OS?
-            if shutil.which("raspivid"):
-                self.cmd_tool = "raspivid"
-                dashboard.log("WARN: Using 'raspivid' fallback")
-            else:
-                self.cmd_tool = None
-                dashboard.error("ERR: No video tool found!")
+        # Check for camera tool in order of preference:
+        # 1. rpicam-vid   (Pi OS Bookworm / Debian 12+)
+        # 2. libcamera-vid (Pi OS Bullseye / Debian 11)
+        # 3. raspivid      (Legacy camera stack)
+        for tool in ["rpicam-vid", "libcamera-vid", "raspivid"]:
+            if shutil.which(tool):
+                self.cmd_tool = tool
+                dashboard.log(f"[OK] Video tool: {tool}")
+                break
+        
+        if self.cmd_tool is None:
+            dashboard.error("ERR: No video tool found (tried rpicam-vid, libcamera-vid, raspivid)")
 
     def start_recording(self):
         if self.process is not None:
@@ -332,9 +335,9 @@ class VideoRecorder:
         self.filename = f"flight_{timestamp}.h264"
         
         cmd = []
-        if self.cmd_tool == "libcamera-vid":
+        if self.cmd_tool in ("rpicam-vid", "libcamera-vid"):
             cmd = [
-                "libcamera-vid",
+                self.cmd_tool,
                 "-t", "0",
                 "--inline",
                 "--width", "1920",
