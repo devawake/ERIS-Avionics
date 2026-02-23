@@ -305,10 +305,15 @@ import subprocess
 import shutil
 
 class VideoRecorder:
+    RECORDINGS_DIR = os.path.expanduser("~/recordings")
+
     def __init__(self):
         self.process = None
         self.filename = None
         self.cmd_tool = None
+        
+        # Create recordings directory
+        os.makedirs(self.RECORDINGS_DIR, exist_ok=True)
         
         # Check for camera tool in order of preference:
         # 1. rpicam-vid   (Pi OS Bookworm / Debian 12+)
@@ -332,7 +337,7 @@ class VideoRecorder:
             return False
             
         timestamp = time.strftime("%Y%m%d-%H%M%S")
-        self.filename = f"flight_{timestamp}.h264"
+        self.filename = os.path.join(self.RECORDINGS_DIR, f"flight_{timestamp}.h264")
         
         cmd = []
         if self.cmd_tool in ("rpicam-vid", "libcamera-vid"):
@@ -355,26 +360,57 @@ class VideoRecorder:
             ]
         
         try:
-            # shell=False is safer, uses list of args
-            self.process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            dashboard.log(f"Video START: {self.filename}")
+            import signal
+            # Capture stderr so we can detect camera failures
+            self.process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            
+            # Give it a moment to start, then check if it crashed immediately
+            time.sleep(0.5)
+            ret = self.process.poll()
+            if ret is not None:
+                # Process already exited = failure
+                err_out = self.process.stderr.read().decode('utf-8', errors='ignore').strip()
+                self.process = None
+                dashboard.error(f"Video Fail: {err_out[:100]}")
+                return False
+            
+            dashboard.log(f"Video REC: {self.filename}")
             return True
         except Exception as e:
             dashboard.error(f"Video Fail: {e}")
+            self.process = None
             return False
 
     def stop_recording(self):
         if self.process is None:
             return
-            
+        
+        import signal
         try:
-            self.process.terminate()
-            self.process.wait(timeout=2)
-            dashboard.log("Video STOPPED")
-        except:
+            # Send SIGINT (like Ctrl+C) so rpicam-vid flushes and finalizes the file
+            # SIGTERM causes it to abort without writing the file properly
+            self.process.send_signal(signal.SIGINT)
+            self.process.wait(timeout=5)
+            
+            # Check if file was actually written
+            if self.filename and os.path.exists(self.filename):
+                size_kb = os.path.getsize(self.filename) / 1024
+                dashboard.log(f"Video SAVED: {size_kb:.0f}KB -> {self.filename}")
+            else:
+                dashboard.error("Video: File not found after stop!")
+        except subprocess.TimeoutExpired:
+            dashboard.error("Video: Graceful stop timed out, killing...")
             try:
                 self.process.kill()
-            except: pass
+                self.process.wait(timeout=2)
+            except Exception:
+                pass
+        except Exception as e:
+            dashboard.error(f"Video stop error: {e}")
+            try:
+                self.process.kill()
+            except Exception:
+                pass
         finally:
             self.process = None
 
