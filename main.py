@@ -364,14 +364,22 @@ class VideoRecorder:
             # Capture stderr so we can detect camera failures
             self.process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             
-            # Give it a moment to start, then check if it crashed immediately
-            time.sleep(0.5)
+            # Camera init can take 1-2 seconds, give it time
+            time.sleep(2.0)
             ret = self.process.poll()
             if ret is not None:
                 # Process already exited = failure
                 err_out = self.process.stderr.read().decode('utf-8', errors='ignore').strip()
                 self.process = None
-                dashboard.error(f"Video Fail: {err_out[:100]}")
+                # Extract the last meaningful error line (rpicam dumps many INFO lines)
+                err_lines = [l for l in err_out.splitlines() if 'ERROR' in l or 'error' in l or 'fail' in l.lower()]
+                if err_lines:
+                    dashboard.error(f"Video Fail: {err_lines[-1][-120:]}")
+                else:
+                    # Show last non-empty line as fallback
+                    last_lines = [l for l in err_out.splitlines() if l.strip()]
+                    msg = last_lines[-1][-120:] if last_lines else f"exit code {ret}"
+                    dashboard.error(f"Video Fail: {msg}")
                 return False
             
             dashboard.log(f"Video REC: {self.filename}")
