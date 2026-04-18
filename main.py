@@ -28,6 +28,7 @@ Data logging:
 import time
 import sys
 import os
+import signal
 import threading
 import RPi.GPIO as GPIO
 import smbus2
@@ -727,6 +728,12 @@ def main():
     GPIO.setmode(GPIO.BCM)
     GPIO.setwarnings(False)
 
+    # Catch SIGTERM (sent by sudo shutdown / systemd stop) so the finally block
+    # runs and video is saved cleanly before the process is killed.
+    def _sigterm_handler(signum, frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+
     buzzer = Buzzer(PIN_BUZZER)
     buzzer.startup_sequence()
 
@@ -745,7 +752,8 @@ def main():
     count = 0
     print("\033[2J")  # Initial clear
 
-    dashboard.log("System ready — short GPIO 16 + GPIO 26 to ARM and start recording.")
+    dashboard.log("System ready — tap GPIO 16 + GPIO 26 to ARM and start recording.")
+    dashboard.log(f"Recordings: {RECORDINGS_DIR}")
     dashboard.log("CSV logging active from boot.")
 
     try:
