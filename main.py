@@ -4,43 +4,46 @@ ERIS Avionics — Main Flight Computer
 UKROC Competition Build
 
 State Machine:
-  IDLE   -> ARMED   : ARM switch (GPIO 16) HIGH + GPS >= 4 sats
+  IDLE   -> ARMED   : Both GPIO 16 AND GPIO 26 shorted together
+                      GPIO 26 = OUTPUT HIGH (3.3 V source)
+                      GPIO 16 = INPUT with pull-down
+                      Shorting the two pins drives GPIO 16 HIGH -> ARMED
   ARMED  -> ASCENT  : az > 2G for 10 consecutive samples (2 s @ 5 Hz)
-                      AND altitude >= ground_alt + 5 m (secondary check)
+                      AND altitude >= ground_alt + 5 m (secondary check, GPS optional)
   ASCENT -> DESCENT : alt drops >= 10 m below max for 5 consecutive samples
   DESCENT-> LANDED  : altitude stable (< 2 m change) + low accel for 5 s
   LANDED   (video stops 10 s after landing confirmed)
 
-ARM Switch wiring:
-  GPIO 16 (BCM) — connect one terminal to 3.3 V, other to GPIO 16.
-  Internal pull-down is enabled. Switch OPEN = IDLE, Switch CLOSED = ARMED.
+ARM wiring:
+  GPIO 26 (BCM) — configured as OUTPUT HIGH (acts as 3.3 V source).
+  GPIO 16 (BCM) — configured as INPUT with internal pull-down.
+  Bridge/short the two pins with a wire or removable link to arm.
+  Remove the link to disarm (safe on pad).
+
+Data logging:
+  All sensor data is logged to CSV from the moment the system boots.
+  No radio / ground-station link required.
 """
 
 import time
 import sys
 import os
 import threading
-import spidev
 import RPi.GPIO as GPIO
 import smbus2
 import serial
 import pynmea2
-import struct
 import subprocess
 import shutil
 import select
 import csv
-import math
-import traceback
 from collections import deque
 
 # ==========================================
 # CONFIGURATION
 # ==========================================
-# Radio
-RADIO_FREQ_MHZ = 433.0
-NODE_ADDRESS   = 0x01
-TX_INTERVAL    = 0.2   # 5 Hz update rate
+# Loop rate
+LOOP_INTERVAL = 0.2   # 5 Hz update rate
 
 # I2C Buses
 I2C_BUS_IMU = 0   # GPIO 0/1
@@ -52,7 +55,8 @@ ADDR_MAG    = 0x0D   # QMC5883L
 
 # Pins
 PIN_BUZZER     = 18
-PIN_ARM_SWITCH = 16   # BCM — screw/key switch, pull-down, HIGH = armed
+PIN_ARM_IN     = 16   # BCM — INPUT with pull-down. HIGH when shorted to PIN_ARM_OUT.
+PIN_ARM_OUT    = 26   # BCM — OUTPUT HIGH (3.3 V source).  Short to PIN_ARM_IN to arm.
 
 # Flight detection tuning
 ACC_1G              = 2060    # Raw LSB value at 1G (calibrate if needed)
@@ -65,129 +69,11 @@ LAND_STABLE_TIME    = 5.0     # Seconds of stable readings to confirm landing
 LAND_STOP_DELAY     = 10.0    # Seconds after LANDED before stopping video
 
 # Video
-RECORDINGS_DIR = "/home/eris/ERIS-Avionics/recordings"
+RECORDINGS_DIR       = "/home/eris/ERIS-Avionics/recordings"
+VIDEO_FPS            = 30        # Recording frame rate
+VIDEO_MAX_DURATION_S = 600       # Auto stop recording 10 minutes after arming (SD card safety)
 
-# ==========================================
-# RFM69HCW DRIVER
-# ==========================================
-REG_FIFO         = 0x00
-REG_OPMODE       = 0x01
-REG_DATAMODUL    = 0x02
-REG_BITRATEMSB   = 0x03
-REG_BITRATELSB   = 0x04
-REG_FDEVMSB      = 0x05
-REG_FDEVLSB      = 0x06
-REG_FRFMSB       = 0x07
-REG_FRFMID       = 0x08
-REG_FRFLSB       = 0x09
-REG_VERSION      = 0x10
-REG_PALEVEL      = 0x11
-REG_OCP          = 0x13
-REG_RXBW         = 0x19
-REG_IRQFLAGS1    = 0x27
-REG_IRQFLAGS2    = 0x28
-REG_SYNCCONFIG   = 0x2E
-REG_SYNCVALUE1   = 0x2F
-REG_SYNCVALUE2   = 0x30
-REG_PACKETCONFIG1= 0x37
-REG_PAYLOADLENGTH= 0x38
-REG_FIFOTHRESH   = 0x3C
-REG_PACKETCONFIG2= 0x3D
-REG_TESTPA1      = 0x5A
-REG_TESTPA2      = 0x5C
-REG_TESTDAGC     = 0x6F
-
-MODE_SLEEP   = 0x00
-MODE_STANDBY = 0x04
-MODE_TX      = 0x0C
-MODE_RX      = 0x10
-
-class RFM69:
-    def __init__(self, spi_bus=0, spi_device=0, reset_pin=25, freq_mhz=433.0):
-        self.reset_pin = reset_pin
-        self.freq_mhz  = freq_mhz
-        self.mode      = MODE_SLEEP
-
-        GPIO.setmode(GPIO.BCM)
-        GPIO.setwarnings(False)
-        GPIO.setup(self.reset_pin, GPIO.OUT)
-
-        self.spi = spidev.SpiDev()
-        self.spi.open(spi_bus, spi_device)
-        self.spi.max_speed_hz = 4000000
-        self.spi.mode = 0b00
-
-        self.reset()
-        self.init_radio()
-
-    def reset(self):
-        GPIO.output(self.reset_pin, GPIO.HIGH)
-        time.sleep(0.1)
-        GPIO.output(self.reset_pin, GPIO.LOW)
-        time.sleep(0.1)
-
-    def write_reg(self, addr, value):
-        self.spi.xfer2([addr | 0x80, value])
-
-    def read_reg(self, addr):
-        return self.spi.xfer2([addr & 0x7F, 0x00])[1]
-
-    def init_radio(self):
-        self.write_reg(REG_OPMODE, MODE_STANDBY)
-        time.sleep(0.01)
-
-        config = [
-            (REG_DATAMODUL,     0x00),
-            (REG_BITRATEMSB,    0x06), (REG_BITRATELSB, 0x83),  # 19.2 kbps
-            (REG_FDEVMSB,       0x01), (REG_FDEVLSB,    0x9A),  # 25 kHz dev
-            (REG_RXBW,          0x42),                            # 83.3 kHz BW
-            (REG_SYNCCONFIG,    0x88), (REG_SYNCVALUE1, 0x2D), (REG_SYNCVALUE2, 0xD4),
-            (REG_PACKETCONFIG1, 0x90),  # Variable len, CRC on
-            (REG_PAYLOADLENGTH, 66),
-            (REG_FIFOTHRESH,    0x8F),
-            (REG_PACKETCONFIG2, 0x02),
-            (REG_TESTDAGC,      0x30),
-        ]
-        for reg, val in config:
-            self.write_reg(reg, val)
-
-        frf = int((self.freq_mhz * 1_000_000) / 61.03515625)
-        self.write_reg(REG_FRFMSB, (frf >> 16) & 0xFF)
-        self.write_reg(REG_FRFMID, (frf >>  8) & 0xFF)
-        self.write_reg(REG_FRFLSB,  frf        & 0xFF)
-
-        # High Power (+20 dBm)
-        self.write_reg(REG_OCP,    0x0F)
-        self.write_reg(REG_PALEVEL, 0x60 | 31)
-        self.write_reg(REG_TESTPA1, 0x5D)
-        self.write_reg(REG_TESTPA2, 0x7C)
-
-    def send(self, data):
-        if isinstance(data, str):
-            data = data.encode('utf-8')
-
-        self.write_reg(REG_OPMODE, MODE_STANDBY)
-        timeout = time.time() + 0.5
-        while not (self.read_reg(REG_IRQFLAGS1) & 0x80):
-            if time.time() > timeout:
-                return False
-            time.sleep(0.001)
-
-        self.spi.xfer2([REG_FIFO | 0x80, len(data)] + list(data))
-        self.write_reg(REG_OPMODE, MODE_TX)
-
-        start = time.time()
-        while not (self.read_reg(REG_IRQFLAGS2) & 0x08):
-            if time.time() - start > 1.0:
-                return False
-            time.sleep(0.001)
-
-        self.write_reg(REG_OPMODE, MODE_STANDBY)
-        return True
-
-    def close(self):
-        self.write_reg(REG_OPMODE, MODE_SLEEP)
-        self.spi.close()
+# RFM69 driver removed — no ground station required.
 
 
 # ==========================================
@@ -281,7 +167,7 @@ class Dashboard:
         print(f"[ERR {time.strftime('%H:%M:%S')}] {msg}")
         self.errors.append(f"[{time.strftime('%H:%M:%S')}] {msg}")
 
-    def render(self, sensor_data, radio_status, video_status, state_str, arm_switch):
+    def render(self, sensor_data, video_status, state_str, arm_pins):
         output = "\033[2J\033[H"
         output += "==================================================\n"
         output += "           ERIS AVIONICS DASHBOARD               \n"
@@ -306,10 +192,9 @@ class Dashboard:
         output += f"MAG   (raw) : X={d.get('mx',0):>7} Y={d.get('my',0):>7} Z={d.get('mz',0):>7}\n"
         output += "\n"
 
-        arm_str = "HIGH (ARMED)" if arm_switch else "LOW  (SAFE) "
-        output += f"ARM SWITCH  : {arm_str}\n"
+        arm_str  = "SHORTED (ARMED)" if arm_pins else "OPEN    (SAFE) "
+        output += f"ARM PINS    : GPIO {PIN_ARM_IN} + GPIO {PIN_ARM_OUT} — {arm_str}\n"
         output += f"FLIGHT STATE: {state_str}\n"
-        output += f"RADIO       : {radio_status}\n"
         output += f"VIDEO       : {video_status}\n"
         output += f"RAW GPS     : {d.get('raw_gps', '')[:60]}\n"
 
@@ -371,10 +256,11 @@ class VideoRecorder:
         if self.cmd_tool in ("rpicam-vid", "libcamera-vid"):
             cmd = [
                 self.cmd_tool,
-                "-t", "0",
+                "-t", "0",           # Run indefinitely (we stop it ourselves)
                 "--inline",
-                "--width",  "1920",
-                "--height", "1080",
+                "--width",     "1920",
+                "--height",    "1080",
+                "--framerate", str(VIDEO_FPS),
                 "-o", self.filename,
                 "--nopreview",
             ]
@@ -384,6 +270,7 @@ class VideoRecorder:
                 "-t", "0",
                 "-w", "1920",
                 "-h", "1080",
+                "-fps", str(VIDEO_FPS),
                 "-o", self.filename,
             ]
 
@@ -548,20 +435,30 @@ class FlightComputer:
         self.apogee_samples  = 0   # Consecutive samples showing altitude drop
         self.stable_start    = 0.0 # Timestamp when stable descent-to-land began
         self.land_time       = 0.0 # Timestamp when LANDED was confirmed
+        self.arm_time        = 0.0 # Timestamp when armed (for video duration cutoff)
 
-        # Arm switch state
-        self._arm_switch_high = False
+        # One-shot arm latch — set True the moment GPIO 16 first reads HIGH.
+        # Never resets; touching pins with a screwdriver is enough to arm.
+        self._arm_triggered  = False
 
-        # Setup arm switch GPIO
+        # Setup arm GPIO pins
+        # GPIO 26 = OUTPUT HIGH (acts as 3.3 V source)
+        # GPIO 16 = INPUT with pull-down; reads HIGH when shorted to GPIO 26
         GPIO.setmode(GPIO.BCM)
         GPIO.setwarnings(False)
-        GPIO.setup(PIN_ARM_SWITCH, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
-        dashboard.log(f"ARM switch configured on GPIO {PIN_ARM_SWITCH} (pull-down)")
+        GPIO.setup(PIN_ARM_OUT, GPIO.OUT)
+        GPIO.output(PIN_ARM_OUT, GPIO.HIGH)
+        GPIO.setup(PIN_ARM_IN, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
+        dashboard.log(f"ARM pins configured — OUT: GPIO {PIN_ARM_OUT} (HIGH), IN: GPIO {PIN_ARM_IN} (pull-down)")
+        dashboard.log("Tap GPIO 16 + GPIO 26 together (e.g. screwdriver) to ARM permanently.")
 
     @property
     def arm_switch(self):
-        """Read the physical arm switch. True = armed position."""
-        return GPIO.input(PIN_ARM_SWITCH) == GPIO.HIGH
+        """Latching arm trigger. Returns True permanently once GPIO 16 has gone HIGH."""
+        if not self._arm_triggered:
+            if GPIO.input(PIN_ARM_IN) == GPIO.HIGH:
+                self._arm_triggered = True
+        return self._arm_triggered
 
     def update(self, data):
         now  = time.time()
@@ -571,6 +468,17 @@ class FlightComputer:
 
         # GPS is considered available only when we have a real fix
         gps_ok = sats >= 4 and alt != 0.0
+
+        # ── VIDEO DURATION CUTOFF ─────────────────────────────────────────────
+        # Stop recording VIDEO_MAX_DURATION_S seconds after arming regardless
+        # of flight state — prevents filling the SD card if launch never happens.
+        if (self.arm_time > 0
+                and self.video and self.video.process is not None
+                and (now - self.arm_time) >= VIDEO_MAX_DURATION_S):
+            mins = VIDEO_MAX_DURATION_S // 60
+            dashboard.log(f"Video auto-cutoff: {mins:.0f} min limit reached — stopping recording.")
+            if self.buzzer: self.buzzer.landed_tone()  # Audible cue that recording stopped
+            self.video.stop_recording()
 
         # Track max altitude from ASCENT onward — only when GPS is valid
         if gps_ok and self.state in (FlightState.ASCENT, FlightState.DESCENT):
@@ -595,7 +503,8 @@ class FlightComputer:
                     self.max_altitude    = 0.0
                     self.last_alt        = 0.0
                     dashboard.log(f">>> ARMED (NO GPS) — IMU-only mode. Sats: {sats}")
-                self.state = FlightState.ARMED
+                self.state    = FlightState.ARMED
+                self.arm_time = time.time()
                 if self.buzzer: self.buzzer.armed_sequence()
                 if self.video:  self.video.start_recording()
 
@@ -624,11 +533,7 @@ class FlightComputer:
                 self.launch_samples = 0
                 if self.buzzer: self.buzzer.launch_tone()
 
-            # Safety: if switch goes LOW while ARMED (pad safe), return to IDLE
-            if not self.arm_switch:
-                dashboard.log("ARM switch LOW — returning to IDLE (pad safe)")
-                self.state = FlightState.IDLE
-                if self.video: self.video.stop_recording()
+            # No disarm path — arm trigger is a one-shot latch.
 
         # ── ASCENT ────────────────────────────────────────────────────────────
         elif self.state == FlightState.ASCENT:
@@ -830,28 +735,18 @@ def main():
     sensors.init_imu()
     sensors.init_mag()
 
+    # CSV logger starts immediately — all data logged from boot
     csv_logger      = CSVLogger()
     flight_computer = FlightComputer(video_recorder=video, buzzer=buzzer)
 
     # GPS background thread
     threading.Thread(target=sensors.run_gps, daemon=True).start()
 
-    # Radio
-    radio        = None
-    radio_status = "INIT"
-    try:
-        radio = RFM69(freq_mhz=RADIO_FREQ_MHZ)
-        dashboard.log("Radio Init OK")
-        radio_status = "OK"
-    except Exception as e:
-        dashboard.error(f"Radio Init: {e}")
-        buzzer.error_tone()
-        radio_status = "FAIL"
-
     count = 0
     print("\033[2J")  # Initial clear
 
-    dashboard.log("System ready — waiting for ARM switch (GPIO 16)...")
+    dashboard.log("System ready — short GPIO 16 + GPIO 26 to ARM and start recording.")
+    dashboard.log("CSV logging active from boot.")
 
     try:
         while True:
@@ -863,41 +758,24 @@ def main():
             with sensors.lock:
                 d = sensors.data.copy()
 
-            # 2. Flight computer update
+            # 2. Flight computer update (state machine)
             flight_computer.update(d)
 
-            # 3. Log to CSV
+            # 3. Log ALL data to CSV on every cycle (from boot, regardless of state)
             csv_logger.log(flight_computer.state, d)
 
-            # 4. Build radio packet
-            #    Full state name transmitted for easier groundstation parsing
+            # 4. Render dashboard (every 10 cycles ≈ 2 s)
             state_str = FlightState.to_str(flight_computer.state)
-            packet = (
-                f"St:{state_str},"
-                f"T:{d['time']},"
-                f"S:{d['sats']},"
-                f"L:{d['lat']:.4f},{d['lon']:.4f},"
-                f"A:{d['alt']:.1f},"
-                f"Z:{d['az']},"
-                f"Max:{flight_computer.max_altitude:.1f}"
-            )
-
-            # 5. Transmit
-            if radio:
-                radio_status = "TX OK" if radio.send(packet) else "TX FAIL"
-
-            # 6. Render dashboard (every 10 cycles = 2 s)
             if count % 10 == 0:
                 vid_str = "REC" if (video.process is not None) else "STOP"
                 dashboard.render(
                     d,
-                    radio_status,
                     vid_str,
                     state_str,
                     flight_computer.arm_switch,
                 )
 
-            # 7. Debug console input (non-blocking)
+            # 5. Debug console input (non-blocking)
             if sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
                 cmd = sys.stdin.readline().strip().lower()
                 if   cmd == 'arm':    flight_computer.force_state(FlightState.ARMED)
@@ -910,7 +788,7 @@ def main():
                     else:
                         video.start_recording()
 
-            # 8. Buzzer heartbeats
+            # 6. Buzzer heartbeats
             if d['sats'] > 3 and count % 50 == 0:
                 buzzer.lock_tone()
             if count % 20 == 0:
@@ -918,15 +796,13 @@ def main():
 
             count += 1
             elapsed = time.time() - loop_start
-            sleep_t = TX_INTERVAL - elapsed
+            sleep_t = LOOP_INTERVAL - elapsed
             if sleep_t > 0:
                 time.sleep(sleep_t)
 
     except KeyboardInterrupt:
         print("\nStopping...")
     finally:
-        if radio:
-            radio.close()
         video.stop_recording()
         buzzer.cleanup()
         try:
