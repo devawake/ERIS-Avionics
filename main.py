@@ -505,7 +505,7 @@ class FlightComputer:
                     dashboard.log(f">>> ARMED (NO GPS) — IMU-only mode. Sats: {sats}")
                 self.state    = FlightState.ARMED
                 self.arm_time = time.time()
-                if self.buzzer: self.buzzer.armed_sequence()
+                if self.buzzer: self.buzzer.startup_sequence()  # Boot tone replayed on arm
                 if self.video:  self.video.start_recording()
 
         # ── ARMED ─────────────────────────────────────────────────────────────
