@@ -105,9 +105,16 @@ class Buzzer:
         threading.Thread(target=self._beep_sync, args=(freq, duration), daemon=True).start()
 
     def startup_sequence(self):
+        """Ascending tones — system armed / boot."""
         self.beep(1000, 0.1); time.sleep(0.05)
         self.beep(1500, 0.1); time.sleep(0.05)
         self.beep(2000, 0.2)
+
+    def shutdown_sequence(self):
+        """Descending tones (reverse of startup) — recording stopped."""
+        self.beep(2000, 0.1); time.sleep(0.05)
+        self.beep(1500, 0.1); time.sleep(0.05)
+        self.beep(1000, 0.2)
 
     def armed_sequence(self):
         """Three quick high beeps — confirms ARM state."""
@@ -438,9 +445,10 @@ class FlightComputer:
         self.land_time       = 0.0 # Timestamp when LANDED was confirmed
         self.arm_time        = 0.0 # Timestamp when armed (for video duration cutoff)
 
-        # One-shot arm latch — set True the moment GPIO 16 first reads HIGH.
-        # Never resets; touching pins with a screwdriver is enough to arm.
-        self._arm_triggered  = False
+        # Pin toggle state — counts rising edges on GPIO 16.
+        # Edge 1 = ARM + start recording. Edge 2 = stop recording.
+        self._arm_count  = 0      # How many times the pin pair has been shorted
+        self._pin_prev   = False  # Previous GPIO 16 level (for edge detection)
 
         # Setup arm GPIO pins
         # GPIO 26 = OUTPUT HIGH (acts as 3.3 V source)
@@ -451,15 +459,19 @@ class FlightComputer:
         GPIO.output(PIN_ARM_OUT, GPIO.HIGH)
         GPIO.setup(PIN_ARM_IN, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
         dashboard.log(f"ARM pins configured — OUT: GPIO {PIN_ARM_OUT} (HIGH), IN: GPIO {PIN_ARM_IN} (pull-down)")
-        dashboard.log("Tap GPIO 16 + GPIO 26 together (e.g. screwdriver) to ARM permanently.")
+        dashboard.log("Tap GPIO 16 + GPIO 26 to ARM.  Tap again to stop & save recording.")
+
+    def _rising_edge(self):
+        """Returns True on a LOW→HIGH transition of GPIO 16 (one pulse per touch)."""
+        current = GPIO.input(PIN_ARM_IN) == GPIO.HIGH
+        edge = current and not self._pin_prev
+        self._pin_prev = current
+        return edge
 
     @property
     def arm_switch(self):
-        """Latching arm trigger. Returns True permanently once GPIO 16 has gone HIGH."""
-        if not self._arm_triggered:
-            if GPIO.input(PIN_ARM_IN) == GPIO.HIGH:
-                self._arm_triggered = True
-        return self._arm_triggered
+        """True once the pins have been touched at least once (for dashboard display)."""
+        return self._arm_count >= 1
 
     def update(self, data):
         now  = time.time()
@@ -470,31 +482,16 @@ class FlightComputer:
         # GPS is considered available only when we have a real fix
         gps_ok = sats >= 4 and alt != 0.0
 
-        # ── VIDEO DURATION CUTOFF ─────────────────────────────────────────────
-        # Stop recording VIDEO_MAX_DURATION_S seconds after arming regardless
-        # of flight state — prevents filling the SD card if launch never happens.
-        if (self.arm_time > 0
-                and self.video and self.video.process is not None
-                and (now - self.arm_time) >= VIDEO_MAX_DURATION_S):
-            mins = VIDEO_MAX_DURATION_S // 60
-            dashboard.log(f"Video auto-cutoff: {mins:.0f} min limit reached — stopping recording.")
-            if self.buzzer: self.buzzer.landed_tone()  # Audible cue that recording stopped
-            self.video.stop_recording()
+        # ── PIN TOGGLE DETECTION ──────────────────────────────────────────
+        if self._rising_edge():
+            self._arm_count += 1
 
-        # Track max altitude from ASCENT onward — only when GPS is valid
-        if gps_ok and self.state in (FlightState.ASCENT, FlightState.DESCENT):
-            if alt > self.max_altitude:
-                self.max_altitude = alt
-
-        # ── IDLE ──────────────────────────────────────────────────────────────
-        if self.state == FlightState.IDLE:
-            # Arm when physical switch is HIGH — GPS is helpful but NOT required.
-            if self.arm_switch:
+            if self._arm_count == 1:
+                # ── FIRST TAP: ARM + start recording ───────────────────────
                 self.launch_samples  = 0
                 self.apogee_samples  = 0
                 self.stable_start    = 0.0
                 if gps_ok:
-                    # Capture ground altitude for altitude-based checks later
                     self.ground_altitude = alt
                     self.max_altitude    = alt
                     self.last_alt        = alt
@@ -505,12 +502,30 @@ class FlightComputer:
                     self.last_alt        = 0.0
                     dashboard.log(f">>> ARMED (NO GPS) — IMU-only mode. Sats: {sats}")
                 self.state    = FlightState.ARMED
-                self.arm_time = time.time()
-                if self.buzzer: self.buzzer.startup_sequence()  # Boot tone replayed on arm
+                self.arm_time = now
+                if self.buzzer: self.buzzer.startup_sequence()   # Ascending tone — armed
                 if self.video:  self.video.start_recording()
 
-        # ── ARMED ─────────────────────────────────────────────────────────────
-        elif self.state == FlightState.ARMED:
+            elif self._arm_count == 2:
+                # ── SECOND TAP: stop recording ──────────────────────────
+                dashboard.log(">>> PIN TAP 2 — stopping and saving recording.")
+                if self.buzzer: self.buzzer.shutdown_sequence()  # Descending tone — done
+                if self.video:  self.video.stop_recording()
+
+        # ── VIDEO DURATION CUTOFF ───────────────────────────────────────
+        # Fallback: auto-stop if recording has run for VIDEO_MAX_DURATION_S.
+        if (self.arm_time > 0
+                and self.video and self.video.process is not None
+                and (now - self.arm_time) >= VIDEO_MAX_DURATION_S):
+            mins = VIDEO_MAX_DURATION_S // 60
+            dashboard.log(f"Video auto-cutoff: {mins:.0f} min limit reached — stopping recording.")
+            if self.buzzer: self.buzzer.shutdown_sequence()
+            self.video.stop_recording()
+
+        # ── IDLE ──────────────────────────────────────────────────────────────
+        # Arm transition is now handled by pin-toggle detection above.
+        if self.state == FlightState.IDLE:
+            pass  # Waiting for first pin tap (handled above)
             # Primary: sustained high-G for LAUNCH_CONFIRM consecutive samples
             if abs(az) > LAUNCH_THRESH_RAW:
                 self.launch_samples += 1
